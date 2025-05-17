@@ -1,0 +1,12 @@
+{
+  "ignore": [
+    "data/*",
+    "messages/*",
+    "node_modules/*",
+    ".git/*"
+  ],
+  "watch": [
+    "src/"
+  ],
+  "ext": "js,json"
+} 
