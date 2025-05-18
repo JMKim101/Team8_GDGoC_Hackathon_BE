@@ -1,7 +1,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { Client, Collection, Events, GatewayIntentBits, REST, Routes } = require('discord.js');
+const { Client, Collection, Events, GatewayIntentBits, REST, Routes, EmbedBuilder, Partials } = require('discord.js');
 const dotenv = require('dotenv');
+const { loadTickets } = require('./utils/ticket');
+const ticket2Embed = require('./utils/ticket2Embed');
+const { generateTickets, storeTickets } = require('./utils/ticket');
+const { days_of_week_value } = require('./utils/date');
 
 dotenv.config();
 
@@ -10,8 +14,10 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
-  ]
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
 client.commands = new Collection();
@@ -31,11 +37,11 @@ for (const file of commandFiles) {
 }
 
 client.once(Events.ClientReady, () => {
-  console.log(`준비 완료! ${client.user?.tag}으로 로그인됨`);
+  console.log(`Ready! ${client.user?.tag} logged in`);
 });
 
 client.login(process.env.TOKEN).catch(error => {
-  console.error('봇 로그인 중 오류 발생:', error);
+  console.error('Error logging in:', error);
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -75,8 +81,8 @@ client.on(Events.InteractionCreate, async interaction => {
     const userName = interaction.user.tag;
 
     // 로그에 기록
-    console.log(`티켓 할당됨: 티켓 ID ${ticketId}`);
-    console.log(`할당된 유저: ${userName} (ID: ${userId})`);
+    console.log(`Ticket assigned: ticket ID ${ticketId}`);
+    console.log(`Assigned user: ${userName} (ID: ${userId})`);
 
     // 데이터베이스나 파일에 정보 저장
     // 실제 구현에서는 이 부분에 데이터 저장 로직 추가
@@ -101,7 +107,7 @@ client.on(Events.InteractionCreate, async interaction => {
       try {
         assignments = JSON.parse(fs.readFileSync(assignmentsFile, 'utf8'));
       } catch (error) {
-        console.error('할당 데이터 로드 중 오류:', error);
+        console.error('Error loading assignments data:', error);
       }
     }
 
@@ -112,7 +118,7 @@ client.on(Events.InteractionCreate, async interaction => {
     try {
       fs.writeFileSync(assignmentsFile, JSON.stringify(assignments, null, 2));
     } catch (error) {
-      console.error('할당 데이터 저장 중 오류:', error);
+      console.error('Error saving assignments data:', error);
     }
 
     // 사용자에게 응답
@@ -131,16 +137,15 @@ const rest = new REST().setToken(process.env.TOKEN);
   try {
     console.log(`Started refreshing ${commands.length} application (/) commands.`);
 
-    // The put method is used to fully refresh all commands in the guild with the current set
+    // 전역 커맨드로 등록
     const data = await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+      Routes.applicationCommands(process.env.CLIENT_ID),
       { body: commands },
     );
 
     console.log(`Successfully reloaded ${data.length} application (/) commands.`);
   } catch (error) {
-    // And of course, make sure you catch and log any errors!
-    console.error(error);
+    console.error('Error registering commands:', error);
   }
 })();
 
@@ -150,65 +155,161 @@ client.on(Events.InteractionCreate, async interaction => {
   // Get the data entered by the user
   const title = interaction.fields.getTextInputValue('ticket-form-title');
   const description = interaction.fields.getTextInputValue('ticket-form-description');
-  console.log({ title, description });
+  const counts = interaction.fields.getTextInputValue('ticket-form-counts') || "0";
+  const number = parseFloat(counts);
+  console.log({ title, description, counts });
 
-  fetch(`${process.env.API_URL}/api/v1/process`, {
+  if (isNaN(number)) {
+    return interaction.reply({ content: '❌ invalid counts', ephemeral: true });
+  }
+
+  const now = new Date();
+  const days_of_week = days_of_week_value[now.getDay()];
+
+  fetch(`${process.env.API_URL}/extract`, {
     method: 'POST',
-    body: JSON.stringify({ title, description }),
+    body: JSON.stringify({
+      prompt_type: "TICKETS",
+      messages: [{
+        author: "",
+        content: `
+        [TITLE] ${title}
+        [DESCRIPTION]${description}
+        `
+      }],
+      counts: number,
+      timestamp: now.toISOString(),
+      days_of_week: days_of_week
+    }),
+    headers: {
+      'Content-Type': 'application/json',
+    },
   }).then(res => res.json()).then(async (data) => {
-    await interaction.reply({ content: 'Process created' });
+    console.log("data", data);
+    const tickets = generateTickets(data.tickets);
+    const embeds = tickets.map((ticket) => ticket2Embed(ticket));
+    console.log("tickets", tickets)
+
+    const ticketIds = await Promise.all(embeds.map(async (embed) => {
+      const msg = await interaction.channel.send({ embeds: [embed] });
+      await msg.react('⚪');
+      return msg.id;
+    }));
+    console.log("ticketIds", ticketIds);
+
+    storeTickets(tickets, ticketIds, interaction.guild.id, interaction.channel.id);
   }).catch(async (err) => {
-    await interaction.reply({ content: `Error creating process: ${err}` });
+    console.error(err);
+    await interaction.editReply({ content: `Error analyzing channel: ${err}` });
   });
 });
 
 client.on("messageReactionAdd", async (reaction, user) => {
   if (user.bot) return;
 
-  console.log(`${user.tag}가 반응: ${reaction.emoji.name}`);
-  // 처리 로직
+  console.log(`${user.tag} reacted: ${reaction.emoji.name}`);
+
   const ticketId = reaction.message.id;
   const userId = user.id;
+  const guildId = reaction.message.guild.id;
 
-  const existingTickets = fs.readFileSync(`data/${reaction.message.guild.id}/tickets.jsonl`, 'utf8');
-  const tickets = jsonlines.parse(existingTickets);
+  try {
+    const tickets = loadTickets(guildId);
+    console.log(tickets);
 
-  const ticket = tickets.find(ticket => ticket.ticketId === ticketId);
-  if (ticket) {
-    // 해당 유저가 이미 다른 티켓을 먹었는지 확인
-    const existingAssignees = tickets
-      .filter(ticket => ticket.assignee === userId)
-      .filter(ticket => ticket.contextId === ticket.contextId);
-    if (existingAssignees.length > 0) {
-      console.log(`${user.tag}가 이미 다른 티켓을 먹었습니다.`);
-      await reaction.users.remove(user);
-      return;
+    const ticket = tickets.find(ticket => ticket.ticketId === ticketId);
+    console.log(ticket);
+    if (ticket) {
+      if (reaction.emoji.name !== '⚪') {
+        await reaction.users.remove(user);
+        return;
+      }
+      // 해당 티켓이 이미 할당되었는지 확인
+      if (ticket.assignee !== "") {
+        console.log(`${user.tag} already assigned this ticket.`);
+        await reaction.users.remove(user);
+        return;
+      }
+
+      // 해당 유저가 이미 다른 티켓을 할당받았는지 확인
+      const existingAssignees = tickets
+        .filter(t => t.assignee === userId)
+        .filter(t => t.contextId === ticket.contextId);
+
+      if (existingAssignees.length > 0) {
+        console.log(`${user.tag} already assigned another ticket.`);
+        await reaction.users.remove(user);
+        return;
+      }
+
+      ticket.assignee = userId;
+      fs.writeFileSync(`data/${guildId}/tickets.json`, JSON.stringify(tickets, null, 2));
+
+      const embed = ticket2Embed(ticket);
+      await reaction.message.edit({ embeds: [embed] });
+      await reaction.message.reactions.removeAll();
+      await reaction.message.react('✅');
     }
+  } catch (error) {
+    console.error('Error processing ticket:', error);
+  }
+});
 
-    // 해당 티켓이 선점되었는지 확인
-    const occupied = ticket.assignee !== "";
-    if (occupied) {
-      console.log(`${user.tag}가 이미 이 티켓을 선점했습니다.`);
-      await reaction.users.remove(user);
-      return;
+const sendRemind = async (ticket, leftTime) => {
+  const guild = await client.guilds.fetch(ticket.guildId).catch(() => null);
+  const assignee = await guild.members.fetch(ticket.assignee).catch(() => null);
+  const url = `https://discord.com/channels/${ticket.guildId}/${ticket.channelId}/${ticket.ticketId}`;
+
+  if (!assignee?.send) {
+    return;
+  }
+
+  await assignee.send({
+    content: `⏰ **[Remind]** Deadline of **${ticket.title}** is **${leftTime}** left.\n🔗 [Ticket Link](${url})`,
+  });
+};
+
+const checkDueDate = async () => {
+  const now = new Date();
+
+  const guildsPath = path.join(__dirname, '../data');
+  const guilds = fs.readdirSync(guildsPath);
+  for (const guild of guilds) {
+    const tickets = loadTickets(guild);
+    for (const ticket of tickets) {
+      const dueDate = new Date(ticket.due_date);
+      let diff = Math.floor((dueDate - now) / 1000 / 60);
+      console.log(ticket.title, ticket.due_date, diff);
+
+      if (diff == 5) {
+        sendRemind(ticket, "5 minutes");
+      } else if (diff == 30) {
+        sendRemind(ticket, "30 minutes");
+      } else if (diff == 60) {
+        sendRemind(ticket, "1 hour");
+      } else if (diff == 60 * 24) {
+        sendRemind(ticket, "1 day");
+      } else if (diff == 60 * 24 * 7) {
+        sendRemind(ticket, "1 week");
+      } else if (diff == 60 * 24 * 30) {
+        sendRemind(ticket, "1 month");
+      }
     }
+  }
+}
 
-    ticket.assignee = userId;
-    fs.writeFileSync(`data/${reaction.message.guild.id}/tickets.jsonl`, jsonlines.stringify(tickets));
-    const embed = new EmbedBuilder()
-      .setColor(ticket.color)
-      .setTitle(`:pencil: [${ticket.title}]`)
-      .addFields(
-        { name: `Assignee`, value: `:bust_in_silhouette: <@${ticket.assignee}>`, inline: true },
-        { name: `Due Date`, value: `:alarm_clock: ${ticket.dueDate.toLocaleString()}`, inline: true },
-        { name: `Priority`, value: `:memo: ${ticket.priority}`, inline: true },
-      )
-      .addFields(
-        { name: `Description`, value: `${ticket.description}`, inline: false },
-      )
-    await reaction.message.edit({ embeds: [embed] });
+setTimeout(checkDueDate, 1000);
+setInterval(checkDueDate, 60 * 1000);
 
-    // remove reaction from message by all users
-    await reaction.users.remove(user);
+client.on('interactionCreate', async (interaction) => {
+  if (interaction.isMessageContextMenuCommand()) {
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
+    try {
+      await command.execute(interaction);
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: 'Error occurred while executing this command!', ephemeral: true });
+    }
   }
 });
